@@ -5,8 +5,9 @@ import certifi
 from htmldate import find_date
 from datetime import datetime, timedelta
 from urllib.parse import urljoin
+import re
 
-# --- 1. THE COMPLETE SOURCES LIST ---
+# --- CONFIGURATION ---
 SOURCES = {
     "MaxCap": "https://maxcapgroup.com.au/category/news/",
     "Qualitas": "https://www.qualitas.com.au/news/",
@@ -27,6 +28,27 @@ SOURCES = {
 MAX_DAYS = 14
 DB_FILE = "processed_links.txt"
 
+def extract_project_details(text):
+    """Scans article text for financial metrics."""
+    # LVR/LTC Patterns
+    ratio_pattern = r'(\d{1,2}(?:\.\d+)?\s?%)\s?(?:LVR|LTC|LCR|ICR)|(?:LVR|LTC|LCR|ICR)\s?(?:of|at)?\s?(\d{1,2}(?:\.\d+)?\s?%)'
+    ratios = re.findall(ratio_pattern, text, re.I)
+    flat_ratios = [item for sublist in ratios for item in sublist if item]
+    
+    # Financial Amounts ($50M, $100 million)
+    money_pattern = r'(\$\d+(?:\.\d+)?\s?[MmBb]|(?:\$\d+(?:\.\d+)?\s?(?:million|billion)))'
+    money = re.findall(money_pattern, text, re.I)
+
+    # GRV Specific
+    grv_pattern = r'(?:GRV|Gross Realisation|End Value|Project Value)\s?(?:of|at)?\s?(\$\d+(?:\.\d+)?\s?[MmBb]|(?:\$\d+(?:\.\d+)?\s?(?:million|billion)))'
+    grv = re.findall(grv_pattern, text, re.I)
+
+    return {
+        "LVR": flat_ratios[0] if flat_ratios else "N/A",
+        "Amt": money[0] if money else "N/A",
+        "GRV": grv[0] if grv else "N/A"
+    }
+
 def get_history():
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r") as f:
@@ -46,57 +68,63 @@ def send_telegram_batched(lines, title):
     token = os.getenv("TELEGRAM_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id: return
-
-    header = f"<b>{title}</b>\n\n"
-    current_chunk = header
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     
-    for line in lines:
-        if len(current_chunk) + len(line) > 3800:
-            requests.post(url, json={"chat_id": chat_id, "text": current_chunk, "parse_mode": "HTML", "disable_web_page_preview": True})
-            current_chunk = header + line + "\n"
-        else:
-            current_chunk += line + "\n"
-    
-    requests.post(url, json={"chat_id": chat_id, "text": current_chunk, "parse_mode": "HTML", "disable_web_page_preview": True})
+    message = f"<b>{title}</b>\n\n" + "\n\n".join(lines)
+    # Split into chunks of 4000 chars
+    for i in range(0, len(message), 4000):
+        requests.post(url, json={
+            "chat_id": chat_id, 
+            "text": message[i:i+4000], 
+            "parse_mode": "HTML", 
+            "disable_web_page_preview": True
+        })
 
 def main():
     history = get_history()
     active_updates = []
     quiet_sources = []
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    headers = {'User-Agent': 'Mozilla/5.0'}
 
-    for name, url in SOURCES.items():
+    for name, site_url in SOURCES.items():
         print(f"🔍 Checking {name}...")
         try:
-            res = requests.get(url, headers=headers, timeout=25, verify=certifi.where())
+            res = requests.get(site_url, headers=headers, timeout=25, verify=certifi.where())
             soup = BeautifulSoup(res.text, 'html.parser')
             found_at_source = False
 
             for a in soup.find_all('a', href=True):
-                # Fix relative URLs (e.g. /news/article -> https://site.com/news/article)
-                link = urljoin(url, a['href'])
+                link = urljoin(site_url, a['href'])
+                if link in history or not link.startswith('http'): continue
                 
-                if link in history or not link.startswith('http'): 
-                    continue
-                
-                # Broaden filter to ensure we don't miss deals on major newsrooms
                 if any(x in link.lower() for x in ['/news', '/insight', '/article', '2025', '2026', 'press']):
                     if is_recent(link):
-                        active_updates.append(f"• <b>{name}</b>: <a href='{link}'>View Article</a>")
+                        # --- NEW: Dig into the article for details ---
+                        try:
+                            art_res = requests.get(link, headers=headers, timeout=15, verify=certifi.where())
+                            details = extract_project_details(art_res.text)
+                        except:
+                            details = {"LVR": "N/A", "Amt": "N/A", "GRV": "N/A"}
+
+                        # Format the entry with details
+                        entry = (f"🏗️ <b>{name}</b>\n"
+                                 f"💰 Amt: {details['Amt']} | 📊 LVR: {details['LVR']}\n"
+                                 f"🏛️ GRV: {details['GRV']}\n"
+                                 f"🔗 <a href='{link}'>Read Full Article</a>")
+                        
+                        active_updates.append(entry)
                         with open(DB_FILE, "a") as f: f.write(link + "\n")
                         history.add(link)
                         found_at_source = True
             
             if not found_at_source: quiet_sources.append(name)
         except Exception as e:
-            print(f"⚠️ Error {name}: {e}")
             quiet_sources.append(f"{name} (Err)")
 
     if active_updates:
-        send_telegram_batched(active_updates, "🏗️ NEW MARKET INTELLIGENCE")
+        send_telegram_batched(active_updates, "🚀 NEW MARKET INTELLIGENCE")
     
-    summary = f"😴 <b>Quiet Sources:</b>\n{', '.join(quiet_sources)}"
+    summary = f"<b>Quiet Sources:</b> {', '.join(quiet_sources)}"
     send_telegram_batched([summary], "📊 SCAN SUMMARY")
 
 if __name__ == "__main__":
