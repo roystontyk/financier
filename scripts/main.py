@@ -2,8 +2,10 @@ import os
 import requests
 from bs4 import BeautifulSoup
 import re
+import certifi
 
-# 1. EXPANDED SOURCES: Targeted news/press release sub-pages
+# --- 1. THE COMPLETE SOURCES LIST ---
+# Targeted news/press sub-pages for Top 10 Lenders & Brokers
 SOURCES = {
     "MaxCap": "https://maxcapgroup.com.au/category/news/",
     "Qualitas": "https://www.qualitas.com.au/news/",
@@ -34,92 +36,81 @@ def save_new_link(url):
         f.write(url + "\n")
 
 def aggressive_extract(text):
-    """
-    Greedy Regex to catch variations: '65% LVR', 'LTC of 70%', '$50 million', '$50M', etc.
-    """
-    # 1. LVR / LTC / LCR / Interest Coverage (Captures 65%, 65.5%, etc)
-    # Looks for any digit + % followed or preceded by finance acronyms
-    ratio_pattern = r'(\d{1,2}(?:\.\d+)?\s?%)\s?(?:LVR|LTC|LCR|ICR|Loan-to-Value|Loan-to-Cost)|(?:LVR|LTC|LCR|ICR)\s?(?:of|at)?\s?(\d{1,2}(?:\.\d+)?\s?%)'
+    """Greedy extraction for LVR, LTC, GRV, and Money."""
+    # Ratios (LVR/LTC/LCR)
+    ratio_pattern = r'(\d{1,2}(?:\.\d+)?\s?%)\s?(?:LVR|LTC|LCR|ICR)|(?:LVR|LTC|LCR|ICR)\s?(?:of|at)?\s?(\d{1,2}(?:\.\d+)?\s?%)'
     ratios = re.findall(ratio_pattern, text, re.I)
     flat_ratios = [item for sublist in ratios for item in sublist if item]
-
-    # 2. Money amounts (Aggressive: catches $50M, $50m, $50 million, $50.5m)
+    
+    # Financial Amounts ($50M, $100 million)
     money_pattern = r'(\$\d+(?:\.\d+)?\s?[MmBb]|(?:\$\d+(?:\.\d+)?\s?(?:million|billion)))'
     money = re.findall(money_pattern, text, re.I)
 
-    # 3. GRV / End Value / Project Value
-    grv_pattern = r'(?:GRV|Gross Realisation|End Value|Project Value|Valued at)\s?(?:of|at|expected to be)?\s?(\$\d+(?:\.\d+)?\s?[MmBb]|(?:\$\d+(?:\.\d+)?\s?(?:million|billion)))'
+    # GRV Specific
+    grv_pattern = r'(?:GRV|Gross Realisation|End Value|Project Value)\s?(?:of|at)?\s?(\$\d+(?:\.\d+)?\s?[MmBb]|(?:\$\d+(?:\.\d+)?\s?(?:million|billion)))'
     grv = re.findall(grv_pattern, text, re.I)
-
-    # 4. Developer / Counterparty Keywords
-    # Identifying if a developer name might be near "developed by" or "partnership with"
-    dev_pattern = r'(?:developed by|developer|partnership with|builder|client)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)'
-    devs = re.findall(dev_pattern, text)
 
     return {
         "Metrics": ", ".join(set(flat_ratios)) if flat_ratios else "N/A",
-        "Amounts": ", ".join(list(dict.fromkeys(money[:4]))) if money else "N/A",
-        "GRV": grv[0] if grv else "N/A",
-        "Probable_Dev": devs[0] if devs else "N/A"
+        "Amounts": ", ".join(list(dict.fromkeys(money[:3]))) if money else "N/A",
+        "GRV": grv[0] if grv else "N/A"
     }
 
 def send_telegram(message):
     token = os.getenv("TELEGRAM_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if token and chat_id:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        # Using a slightly longer timeout for reliable delivery
-        requests.post(url, json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}, timeout=10)
+    if not token or not chat_id:
+        print("❌ Error: Missing Telegram Secrets")
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        res = requests.post(url, json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}, timeout=15)
+        if res.status_code == 200:
+            print("✅ Notification sent.")
+        else:
+            print(f"❌ Telegram Error: {res.text}")
+    except Exception as e:
+        print(f"❌ Connection Error: {e}")
 
 def main():
     processed = get_processed_links()
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     
     for name, url in SOURCES.items():
+        print(f"🔍 Checking {name}...")
         try:
-            res = requests.get(url, headers=headers, timeout=20)
+            # verify=certifi.where() solves the SSLError you saw in the logs
+            res = requests.get(url, headers=headers, timeout=20, verify=certifi.where())
             soup = BeautifulSoup(res.text, 'html.parser')
             
-            # Aggressive Link Hunting: Look for any link that isn't a Nav item or Social link
-            links_found = 0
+            new_deals_found = 0
             for a in soup.find_all('a', href=True):
                 href = a['href']
-                # Clean relative URLs
-                if href.startswith('/'):
-                    base = "/".join(url.split("/")[:3])
-                    href = base + href
+                if not href.startswith('http'): continue
+                if href in processed: continue
                 
-                if href in processed or not href.startswith('http'):
-                    continue
-
-                # Broad filter: If the link contains keywords or the site-name, check it
-                if any(kw in href.lower() for kw in ['news', 'article', 'press', 'media', 'deal', 'insights', 'transaction']):
-                    art_res = requests.get(href, headers=headers, timeout=15)
-                    art_soup = BeautifulSoup(art_res.text, 'html.parser')
-                    full_text = art_soup.get_text()
+                # Check for article-like keywords
+                if any(kw in href.lower() for kw in ['news', 'article', 'press', 'media', 'deal', 'insights']):
+                    print(f"✨ New link found: {href}")
+                    art_res = requests.get(href, headers=headers, timeout=15, verify=certifi.where())
+                    data = aggressive_extract(art_res.text)
                     
-                    # Extract Data
-                    data = aggressive_extract(full_text)
-                    
-                    # ONLY send if we found at least a Dollar Amount or an LVR (filters out "noise")
+                    # Only notify if financial data is detected
                     if data["Amounts"] != "N/A" or data["Metrics"] != "N/A":
                         msg = (
-                            f"🚨 *NEW DEAL DETECTED: {name}*\n"
-                            f"🔗 [Read Article]({href})\n\n"
-                            f"💰 **Facility/Loan:** {data['Amounts']}\n"
-                            f"📊 **LVR/LTC/ICR:** {data['Metrics']}\n"
-                            f"🏛️ **GRV/Value:** {data['GRV']}\n"
-                            f"👷 **Ref. Developer:** {data['Probable_Dev']}"
+                            f"🏗️ *NEW DEAL: {name}*\n"
+                            f"🔗 [Link]({href})\n\n"
+                            f"💰 **Facility:** {data['Amounts']}\n"
+                            f"📊 **LVR/LTC:** {data['Metrics']}\n"
+                            f"🏛️ **GRV:** {data['GRV']}"
                         )
                         send_telegram(msg)
                         save_new_link(href)
-                        links_found += 1
-                        
-                if links_found >= 2: # Check up to 2 new articles per site per run
-                    break
-                    
+                        new_deals_found += 1
+                
+                if new_deals_found >= 2: break # Limit per site per run
         except Exception as e:
-            print(f"Error on {name}: {e}")
+            print(f"⚠️ Failed {name}: {e}")
 
 if __name__ == "__main__":
     main()
