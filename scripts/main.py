@@ -3,7 +3,7 @@ import requests
 from bs4 import BeautifulSoup
 import certifi
 from htmldate import find_date
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone # Added timezone
 from urllib.parse import urljoin
 import re
 
@@ -28,18 +28,18 @@ SOURCES = {
 MAX_DAYS = 14
 DB_FILE = "processed_links.txt"
 
+# --- MELBOURNE TIME HELPER ---
+MELB_TZ = timezone(timedelta(hours=11))
+
 def extract_project_details(text):
     """Scans article text for financial metrics."""
-    # LVR/LTC Patterns
     ratio_pattern = r'(\d{1,2}(?:\.\d+)?\s?%)\s?(?:LVR|LTC|LCR|ICR)|(?:LVR|LTC|LCR|ICR)\s?(?:of|at)?\s?(\d{1,2}(?:\.\d+)?\s?%)'
     ratios = re.findall(ratio_pattern, text, re.I)
     flat_ratios = [item for sublist in ratios for item in sublist if item]
     
-    # Financial Amounts ($50M, $100 million)
     money_pattern = r'(\$\d+(?:\.\d+)?\s?[MmBb]|(?:\$\d+(?:\.\d+)?\s?(?:million|billion)))'
     money = re.findall(money_pattern, text, re.I)
 
-    # GRV Specific
     grv_pattern = r'(?:GRV|Gross Realisation|End Value|Project Value)\s?(?:of|at)?\s?(\$\d+(?:\.\d+)?\s?[MmBb]|(?:\$\d+(?:\.\d+)?\s?(?:million|billion)))'
     grv = re.findall(grv_pattern, text, re.I)
 
@@ -59,8 +59,9 @@ def is_recent(url):
     try:
         date_str = find_date(url)
         if not date_str: return True
-        pub_date = datetime.strptime(date_str, '%Y-%m-%d')
-        return pub_date > (datetime.now() - timedelta(days=MAX_DAYS))
+        pub_date = datetime.strptime(date_str, '%Y-%m-%d').replace(tzinfo=MELB_TZ)
+        # AMENDED: Compare against Melbourne "now"
+        return pub_date > (datetime.now(MELB_TZ) - timedelta(days=MAX_DAYS))
     except:
         return True
 
@@ -71,7 +72,6 @@ def send_telegram_batched(lines, title):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     
     message = f"<b>{title}</b>\n\n" + "\n\n".join(lines)
-    # Split into chunks of 4000 chars
     for i in range(0, len(message), 4000):
         requests.post(url, json={
             "chat_id": chat_id, 
@@ -99,14 +99,12 @@ def main():
                 
                 if any(x in link.lower() for x in ['/news', '/insight', '/article', '2025', '2026', 'press']):
                     if is_recent(link):
-                        # --- NEW: Dig into the article for details ---
                         try:
                             art_res = requests.get(link, headers=headers, timeout=15, verify=certifi.where())
                             details = extract_project_details(art_res.text)
                         except:
                             details = {"LVR": "N/A", "Amt": "N/A", "GRV": "N/A"}
 
-                        # Format the entry with details
                         entry = (f"🏗️ <b>{name}</b>\n"
                                  f"💰 Amt: {details['Amt']} | 📊 LVR: {details['LVR']}\n"
                                  f"🏛️ GRV: {details['GRV']}\n"
@@ -124,7 +122,9 @@ def main():
     if active_updates:
         send_telegram_batched(active_updates, "🚀 NEW MARKET INTELLIGENCE")
     
-    summary = f"<b>Quiet Sources:</b> {', '.join(quiet_sources)}"
+    # AMENDED: Summary with Melbourne timestamp
+    ts = datetime.now(MELB_TZ).strftime('%d %b %Y %H:%M')
+    summary = f"<b>Quiet Sources:</b> {', '.join(quiet_sources)}\n\n<i>Scan Time: {ts}</i>"
     send_telegram_batched([summary], "📊 SCAN SUMMARY")
 
 if __name__ == "__main__":
