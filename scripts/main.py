@@ -26,38 +26,50 @@ def get_history():
     return set()
 
 def is_recent(url):
-    """Checks if the article was published within the last 14 days."""
     try:
-        date_str = find_date(url) # Returns YYYY-MM-DD
-        if not date_str: return True # If we can't find a date, we take a chance
+        date_str = find_date(url)
+        if not date_str: return True
         pub_date = datetime.strptime(date_str, '%Y-%m-%d')
         cutoff = datetime.now() - timedelta(days=MAX_DAYS)
         return pub_date > cutoff
     except:
         return True
 
+def send_telegram(text):
+    token = os.getenv("TELEGRAM_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        print("❌ Telegram credentials missing")
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        response = requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=15)
+        response.raise_for_status()
+    except Exception as e:
+        print(f"❌ Telegram send failed: {e}")
+
 def main():
     history = get_history()
     active_updates = []
     quiet_sources = []
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 
+    print("🚀 Starting Scan...")
+    
     for name, url in SOURCES.items():
         print(f"🔍 Checking {name}...")
         try:
-            res = requests.get(url, headers=headers, timeout=15, verify=certifi.where())
+            res = requests.get(url, headers=headers, timeout=20, verify=certifi.where())
             soup = BeautifulSoup(res.text, 'html.parser')
             found_at_source = False
 
-            # We only look for links that likely point to actual articles
             for a in soup.find_all('a', href=True):
                 link = a['href']
                 if not link.startswith('http') or link in history: continue
                 
-                # Filter for typical news URL patterns to avoid "Contact Us" etc.
+                # Filter for likely news articles
                 if any(x in link.lower() for x in ['/news/', '/insights/', '/article/', '2026', '2025']):
                     if is_recent(link):
-                        # Simple extraction for the alert
                         active_updates.append(f"✅ *{name}*: {link}")
                         with open(DB_FILE, "a") as f: f.write(link + "\n")
                         history.add(link)
@@ -66,22 +78,20 @@ def main():
             if not found_at_source:
                 quiet_sources.append(name)
         except Exception as e:
-            quiet_sources.append(f"{name} (Error)")
+            print(f"⚠️ Error checking {name}: {e}")
+            quiet_sources.append(f"{name} (Err)")
 
-    # Construct the summary message
-    message = "🏁 **Market Intelligence Scan**\n\n"
+    # Construct the final summary
+    summary = "🏁 **Market Intelligence Scan**\n\n"
     if active_updates:
-        message += "🚀 **New Deals/Insights Found:**\n" + "\n".join(active_updates)
+        summary += "🚀 **New Deals/Insights Found:**\n" + "\n".join(active_updates)
     else:
-        message += "😴 No new deals found in the last 14 days."
+        summary += "😴 No new news found in the last 14 days."
     
-    message += "\n\n🔇 **No Changes:** " + ", ".join(quiet_sources)
+    summary += "\n\n🔇 **Quiet Sources:** " + ", ".join(quiet_sources)
     
-    # Send to Telegram
-    token = os.getenv("TELEGRAM_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
-                  json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"})
+    print("📤 Sending summary to Telegram...")
+    send_telegram(summary)
 
 if __name__ == "__main__":
     main()
